@@ -1,9 +1,10 @@
 import os
+import subprocess
 
 import pytest
 
 import claude_client
-from claude_client import build_command, build_prompt, launch_command
+from claude_client import build_command, build_prompt, launch_command, run
 from models import AppConfig, Server
 
 
@@ -64,3 +65,54 @@ def test_launch_command_wraps_cmd(monkeypatch):
     cmd = launch_command(["claude", "--print"])
     assert cmd[0] == "C:/Windows/System32/cmd.exe"
     assert cmd[1:4] == ["/d", "/s", "/c"]
+
+
+class FakeProc:
+    def __init__(self, returncode=0, stdout="ok", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_run_not_found(monkeypatch):
+    monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: None)
+    r = run(AppConfig(workspace_dir="C:/ws"), [make_server()], "x")
+    assert r.status == "not_found"
+
+
+def test_run_success(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(launch, input, capture_output, text, encoding, cwd, timeout):
+        captured["input"] = input
+        captured["cwd"] = cwd
+        captured["launch"] = launch
+        return FakeProc(0, "分析结果", "")
+
+    monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: "C:/claude.cmd")
+    monkeypatch.setattr(claude_client.subprocess, "run", fake_run)
+    ws = str(tmp_path / "ws")
+    r = run(AppConfig(workspace_dir=ws), [make_server()], "x")
+    assert r.status == "success"
+    assert r.output == "分析结果"
+    assert "prod" in captured["input"]
+    assert captured["cwd"] == ws
+
+
+def test_run_nonzero(monkeypatch, tmp_path):
+    monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: "claude")
+    monkeypatch.setattr(claude_client.subprocess, "run",
+                        lambda *args, **kw: FakeProc(1, "", "boom"))
+    r = run(AppConfig(workspace_dir=str(tmp_path)), [make_server()], "x")
+    assert r.status == "error"
+    assert "boom" in r.error
+
+
+def test_run_timeout(monkeypatch, tmp_path):
+    def fake_run(*args, **kw):
+        raise subprocess.TimeoutExpired(cmd=["claude"], timeout=1)
+
+    monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: "claude")
+    monkeypatch.setattr(claude_client.subprocess, "run", fake_run)
+    r = run(AppConfig(workspace_dir=str(tmp_path)), [make_server()], "x")
+    assert r.status == "timeout"

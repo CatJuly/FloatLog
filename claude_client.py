@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -80,3 +81,48 @@ def launch_command(cmd: list[str]) -> list[str]:
     if resolved == executable:
         return cmd
     return [resolved, *cmd[1:]]
+
+
+def run(config: AppConfig, servers: list[Server], user_prompt: str) -> ClaudeResult:
+    if resolve_binary(config.claude_command) is None:
+        return ClaudeResult(
+            status="not_found",
+            output="",
+            error=f"未找到命令: {config.claude_command}",
+        )
+
+    prompt = build_prompt(servers, user_prompt)
+    cmd = build_command(config)
+    launch = launch_command(cmd)
+
+    workspace = Path(config.workspace_dir)
+    workspace.mkdir(parents=True, exist_ok=True)
+
+    try:
+        proc = subprocess.run(
+            launch,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            cwd=str(workspace),
+            timeout=config.timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return ClaudeResult(
+            status="timeout",
+            output="",
+            error=f"运行超时（{config.timeout_seconds} 秒）",
+        )
+    except OSError as exc:
+        return ClaudeResult(status="error", output="", error=str(exc))
+
+    output = proc.stdout or ""
+    err = proc.stderr or ""
+    if proc.returncode == 0:
+        return ClaudeResult(status="success", output=output, error=err)
+    return ClaudeResult(
+        status="error",
+        output=output,
+        error=err or f"claude 退出码 {proc.returncode}",
+    )
