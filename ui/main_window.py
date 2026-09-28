@@ -192,6 +192,8 @@ class MainWindow(QWidget):
         self.send_btn.setText("运行中…")
         self.result_view.setPlainText("正在分析，请稍候…")
 
+        if getattr(self, "_worker", None) is not None and self._worker.isRunning():
+            self._worker.wait()
         self._worker = Worker(self.config, servers, user_prompt)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
