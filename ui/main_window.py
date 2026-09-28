@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
 
 from models import Server, AppConfig
 from storage import Storage
-from claude_client import run as run_claude
+from claude_client import ClaudeResult, run as run_claude
 
 from .server_dialog import ServerDialog
 from .settings_dialog import SettingsDialog
@@ -221,5 +221,8 @@ class Worker(QThread):
         self._user_prompt = user_prompt
 
     def run(self) -> None:
-        result = run_claude(self._config, self._servers, self._user_prompt)
+        try:
+            result = run_claude(self._config, self._servers, self._user_prompt)
+        except Exception as exc:
+            result = ClaudeResult(status="error", output="", error=str(exc))
         self.finished.emit(result)
