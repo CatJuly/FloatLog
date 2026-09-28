@@ -1,5 +1,10 @@
-from claude_client import build_prompt
-from models import Server
+import os
+
+import pytest
+
+import claude_client
+from claude_client import build_command, build_prompt, launch_command
+from models import AppConfig, Server
 
 
 def make_server(name="prod", host="1.2.3.4", **kw):
@@ -32,3 +37,30 @@ def test_build_prompt_key_auth():
     s = make_server(auth_type="key", secret="C:/Users/me/.ssh/id_rsa")
     p = build_prompt([s], "x")
     assert "私钥路径: C:/Users/me/.ssh/id_rsa" in p
+
+
+def test_build_command():
+    c = AppConfig(workspace_dir="C:/ws", permission_mode="bypassPermissions")
+    assert build_command(c) == [
+        "claude", "--print", "--output-format", "text", "--input-format", "text",
+        "--add-dir", "C:/ws", "--permission-mode", "bypassPermissions",
+    ]
+
+
+def test_resolve_binary_found(monkeypatch):
+    monkeypatch.setattr(claude_client.shutil, "which", lambda cmd: "C:/tools/claude.cmd")
+    assert claude_client.resolve_binary("claude") == "C:/tools/claude.cmd"
+
+
+def test_resolve_binary_not_found(monkeypatch):
+    monkeypatch.setattr(claude_client.shutil, "which", lambda cmd: None)
+    assert claude_client.resolve_binary("claude") is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only .cmd wrapping")
+def test_launch_command_wraps_cmd(monkeypatch):
+    monkeypatch.setattr(claude_client.shutil, "which", lambda cmd: "C:/tools/claude.cmd")
+    monkeypatch.setenv("COMSPEC", "C:/Windows/System32/cmd.exe")
+    cmd = launch_command(["claude", "--print"])
+    assert cmd[0] == "C:/Windows/System32/cmd.exe"
+    assert cmd[1:4] == ["/d", "/s", "/c"]
