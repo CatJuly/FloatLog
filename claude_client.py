@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +13,7 @@ from models import Server, AppConfig
 
 @dataclass
 class ClaudeResult:
-    status: str  # "success" | "not_found" | "timeout" | "error"
+    status: str  # "success" | "not_found" | "timeout" | "error" | "cancelled"
     output: str
     error: str = ""
     session_id: str = ""  # 本次对话的 session id（空串表示没有会话）
@@ -107,8 +108,23 @@ def launch_command(cmd: list[str]) -> list[str]:
     return [resolved, *cmd[1:]]
 
 
+def _kill_process(proc: subprocess.Popen) -> None:
+    """终止正在运行的 claude 子进程（Windows 下连同其子进程树一起结束）。"""
+    if proc.poll() is not None:
+        return
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        proc.kill()
+
+
 def run(config: AppConfig, servers: list[Server], user_prompt: str,
-        session_id: str | None = None) -> ClaudeResult:
+        session_id: str | None = None,
+        cancel_event: threading.Event | None = None) -> ClaudeResult:
     if resolve_binary(config.claude_command) is None:
         return ClaudeResult(
             status="not_found",
@@ -128,28 +144,47 @@ def run(config: AppConfig, servers: list[Server], user_prompt: str,
     workspace.mkdir(parents=True, exist_ok=True)
 
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             launch,
-            input=prompt,
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             cwd=str(workspace),
-            timeout=config.timeout_seconds,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
+    except OSError as exc:
+        return ClaudeResult(status="error", output="", error=str(exc), session_id=sid)
+
+    # 取消监听：外部 set cancel_event 时，终止子进程
+    if cancel_event is not None:
+        def _watch() -> None:
+            while proc.poll() is None and not cancel_event.wait(timeout=0.1):
+                pass
+            if proc.poll() is None:
+                _kill_process(proc)
+        threading.Thread(target=_watch, daemon=True).start()
+
+    try:
+        out, err = proc.communicate(input=prompt, timeout=config.timeout_seconds)
     except subprocess.TimeoutExpired:
+        _kill_process(proc)
+        out, err = proc.communicate()
+        if cancel_event is not None and cancel_event.is_set():
+            return ClaudeResult(status="cancelled", output="", error="已停止", session_id=sid)
         return ClaudeResult(
             status="timeout",
             output="",
             error=f"运行超时（{config.timeout_seconds} 秒）",
             session_id=sid,
         )
-    except OSError as exc:
-        return ClaudeResult(status="error", output="", error=str(exc), session_id=sid)
 
-    output = proc.stdout or ""
-    err = proc.stderr or ""
+    if cancel_event is not None and cancel_event.is_set():
+        return ClaudeResult(status="cancelled", output=out or "", error="已停止", session_id=sid)
+
+    output = out or ""
+    err = err or ""
     if proc.returncode == 0:
         return ClaudeResult(status="success", output=output, error=err, session_id=sid)
     return ClaudeResult(

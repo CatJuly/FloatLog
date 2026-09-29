@@ -1,5 +1,6 @@
 import os
 import subprocess
+import threading
 
 import pytest
 
@@ -95,11 +96,26 @@ def test_launch_command_wraps_cmd(monkeypatch):
     assert cmd[1:4] == ["/d", "/s", "/c"]
 
 
-class FakeProc:
-    def __init__(self, returncode=0, stdout="ok", stderr=""):
-        self.returncode = returncode
+class FakePopen:
+    def __init__(self, stdout="ok", stderr="", returncode=0):
         self.stdout = stdout
         self.stderr = stderr
+        self._returncode = returncode
+        self.returncode = None  # 进程“运行中”，communicate 后才结束
+        self.pid = 1234
+        self.killed = False
+
+    def poll(self):
+        return self.returncode
+
+    def communicate(self, input=None, timeout=None):
+        self.input = input
+        self.returncode = self._returncode
+        return self.stdout, self.stderr
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -1
 
 
 def test_run_not_found(monkeypatch):
@@ -118,50 +134,58 @@ def test_run_not_found_no_session(monkeypatch):
 
 def test_run_success(monkeypatch, tmp_path):
     captured = {}
+    proc_holder = {}
 
-    def fake_run(launch, input, capture_output, text, encoding, cwd, timeout, creationflags):
-        captured["input"] = input
-        captured["cwd"] = cwd
-        captured["launch"] = launch
-        captured["creationflags"] = creationflags
-        return FakeProc(0, "分析结果", "")
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        captured["cwd"] = kwargs["cwd"]
+        captured["creationflags"] = kwargs["creationflags"]
+        proc = FakePopen("分析结果", "", returncode=0)
+        proc_holder["proc"] = proc
+        return proc
 
     monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: "C:/claude.cmd")
-    monkeypatch.setattr(claude_client.subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_client.subprocess, "Popen", fake_popen)
     ws = str(tmp_path / "ws")
     r = run(AppConfig(workspace_dir=ws), [make_server()], "x")
     assert r.status == "success"
     assert r.output == "分析结果"
     assert r.session_id
-    assert "--session-id" in captured["launch"]
-    assert "prod" in captured["input"]
+    assert "--session-id" in captured["argv"]
+    assert "prod" in proc_holder["proc"].input
     assert captured["cwd"] == ws
     assert captured["creationflags"] == (subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
 
 def test_run_nonzero(monkeypatch, tmp_path):
     monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: "claude")
-    monkeypatch.setattr(claude_client.subprocess, "run",
-                        lambda *args, **kw: FakeProc(1, "", "boom"))
+    monkeypatch.setattr(claude_client.subprocess, "Popen",
+                        lambda argv, **kwargs: FakePopen("", "boom", returncode=1))
     r = run(AppConfig(workspace_dir=str(tmp_path)), [make_server()], "x")
     assert r.status == "error"
     assert "boom" in r.error
 
 
 def test_run_timeout(monkeypatch, tmp_path):
-    def fake_run(*args, **kw):
-        raise subprocess.TimeoutExpired(cmd=["claude"], timeout=1)
+    class TimeoutProc(FakePopen):
+        def communicate(self, input=None, timeout=None):
+            if timeout is not None and not getattr(self, "_raised", False):
+                self._raised = True
+                raise subprocess.TimeoutExpired(cmd=["claude"], timeout=timeout)
+            return "partial", ""
 
     monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: "claude")
-    monkeypatch.setattr(claude_client.subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_client, "_kill_process", lambda proc: None)
+    monkeypatch.setattr(claude_client.subprocess, "Popen",
+                        lambda argv, **kwargs: TimeoutProc())
     r = run(AppConfig(workspace_dir=str(tmp_path)), [make_server()], "x")
     assert r.status == "timeout"
 
 
 def test_run_new_session_generates_id(monkeypatch, tmp_path):
     monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: "claude")
-    monkeypatch.setattr(claude_client.subprocess, "run",
-                        lambda *args, **kw: FakeProc(0, "ok", ""))
+    monkeypatch.setattr(claude_client.subprocess, "Popen",
+                        lambda argv, **kwargs: FakePopen("ok", "", returncode=0))
     r = run(AppConfig(workspace_dir=str(tmp_path)), [make_server()], "x")
     assert r.status == "success"
     assert r.session_id
@@ -170,16 +194,28 @@ def test_run_new_session_generates_id(monkeypatch, tmp_path):
 def test_run_resume_uses_resume_flag(monkeypatch, tmp_path):
     captured = {}
 
-    def fake_run(launch, **kw):
-        captured["launch"] = launch
-        return FakeProc(0, "ok", "")
+    def fake_popen(argv, **kwargs):
+        captured["argv"] = argv
+        return FakePopen("ok", "", returncode=0)
 
     monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: "claude")
-    monkeypatch.setattr(claude_client.subprocess, "run", fake_run)
+    monkeypatch.setattr(claude_client.subprocess, "Popen", fake_popen)
     sid = "44444444-4444-4444-4444-444444444444"
     r = run(AppConfig(workspace_dir=str(tmp_path)), [make_server()], "x",
             session_id=sid)
     assert r.status == "success"
     assert r.session_id == sid
-    assert "--resume" in captured["launch"]
-    assert "--session-id" not in captured["launch"]
+    assert "--resume" in captured["argv"]
+    assert "--session-id" not in captured["argv"]
+
+
+def test_run_cancelled(monkeypatch, tmp_path):
+    monkeypatch.setattr(claude_client, "resolve_binary", lambda cmd: "claude")
+    monkeypatch.setattr(claude_client, "_kill_process", lambda proc: None)
+    monkeypatch.setattr(claude_client.subprocess, "Popen",
+                        lambda argv, **kwargs: FakePopen("partial", "", returncode=0))
+    cancel = threading.Event()
+    cancel.set()
+    r = run(AppConfig(workspace_dir=str(tmp_path)), [make_server()], "x",
+            cancel_event=cancel)
+    assert r.status == "cancelled"

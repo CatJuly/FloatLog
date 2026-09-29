@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from PySide6.QtCore import Qt, QPoint, QThread, Signal
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget,
@@ -109,6 +111,11 @@ class MainWindow(QWidget):
         self.send_btn = QPushButton("发送分析")
         self.send_btn.clicked.connect(self.send)
         send_row.addWidget(self.send_btn, stretch=3)
+        self.stop_btn = QPushButton("停止")
+        self.stop_btn.setToolTip("停止当前正在运行的分析")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.clicked.connect(self.stop_analysis)
+        send_row.addWidget(self.stop_btn, stretch=1)
         self.new_chat_btn = QPushButton("新对话")
         self.new_chat_btn.setToolTip("开始一个全新的对话，下次分析不再续接上一次会话")
         self.new_chat_btn.clicked.connect(self.new_conversation)
@@ -196,6 +203,7 @@ class MainWindow(QWidget):
 
         self.send_btn.setEnabled(False)
         self.send_btn.setText("运行中…")
+        self.stop_btn.setEnabled(True)
         self.result_view.setPlainText("正在分析，请稍候…")
 
         if getattr(self, "_worker", None) is not None and self._worker.isRunning():
@@ -208,12 +216,21 @@ class MainWindow(QWidget):
     def _on_finished(self, result) -> None:
         self.send_btn.setEnabled(True)
         self.send_btn.setText("发送分析")
+        self.stop_btn.setEnabled(False)
         if result.session_id:
             self.storage.save_session_id(result.session_id)
-        if result.ok:
+        if result.status == "cancelled":
+            self.result_view.setPlainText("已停止本次分析。")
+        elif result.ok:
             self.result_view.setPlainText(result.output or "(无输出)")
         else:
             self.result_view.setPlainText(f"[{result.status}] {result.error}")
+
+    def stop_analysis(self) -> None:
+        worker = getattr(self, "_worker", None)
+        if worker is not None and worker.isRunning():
+            worker.cancel()
+            self.result_view.setPlainText("正在停止…")
 
     def new_conversation(self) -> None:
         if getattr(self, "_worker", None) is not None and self._worker.isRunning():
@@ -237,11 +254,15 @@ class Worker(QThread):
         self._servers = servers
         self._user_prompt = user_prompt
         self._session_id = session_id
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
 
     def run(self) -> None:
         try:
             result = run_claude(self._config, self._servers, self._user_prompt,
-                                self._session_id)
+                                self._session_id, self._cancel)
         except Exception as exc:
             result = ClaudeResult(status="error", output="", error=str(exc))
         self.finished.emit(result)
