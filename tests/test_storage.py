@@ -32,3 +32,19 @@ def test_save_and_load_config(tmp_path):
                   permission_mode="plan", timeout_seconds=10)
     s.save_config(c)
     assert s.load_config() == c
+
+
+def test_session_id_round_trip(tmp_path):
+    s = Storage(tmp_path)
+    assert s.load_session_id() is None
+    sid = "44444444-4444-4444-4444-444444444444"
+    s.save_session_id(sid)
+    assert s.load_session_id() == sid
+
+
+def test_session_id_clear(tmp_path):
+    s = Storage(tmp_path)
+    s.save_session_id("some-id")
+    s.save_session_id(None)
+    assert s.load_session_id() is None
+    assert not (tmp_path / "session.json").exists()

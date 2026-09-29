@@ -105,9 +105,15 @@ class MainWindow(QWidget):
         self.prompt_edit.setPlaceholderText("例如：分析今天的错误日志")
         body.addWidget(self.prompt_edit)
 
+        send_row = QHBoxLayout()
         self.send_btn = QPushButton("发送分析")
         self.send_btn.clicked.connect(self.send)
-        body.addWidget(self.send_btn)
+        send_row.addWidget(self.send_btn, stretch=3)
+        self.new_chat_btn = QPushButton("新对话")
+        self.new_chat_btn.setToolTip("开始一个全新的对话，下次分析不再续接上一次会话")
+        self.new_chat_btn.clicked.connect(self.new_conversation)
+        send_row.addWidget(self.new_chat_btn, stretch=1)
+        body.addLayout(send_row)
 
         body.addWidget(QLabel("结果："))
         self.result_view = QPlainTextEdit()
@@ -194,17 +200,27 @@ class MainWindow(QWidget):
 
         if getattr(self, "_worker", None) is not None and self._worker.isRunning():
             self._worker.wait()
-        self._worker = Worker(self.config, servers, user_prompt)
+        session_id = self.storage.load_session_id()
+        self._worker = Worker(self.config, servers, user_prompt, session_id)
         self._worker.finished.connect(self._on_finished)
         self._worker.start()
 
     def _on_finished(self, result) -> None:
         self.send_btn.setEnabled(True)
         self.send_btn.setText("发送分析")
+        if result.session_id:
+            self.storage.save_session_id(result.session_id)
         if result.ok:
             self.result_view.setPlainText(result.output or "(无输出)")
         else:
             self.result_view.setPlainText(f"[{result.status}] {result.error}")
+
+    def new_conversation(self) -> None:
+        if getattr(self, "_worker", None) is not None and self._worker.isRunning():
+            QMessageBox.information(self, "提示", "请等待当前分析完成后再开启新对话")
+            return
+        self.storage.save_session_id(None)
+        self.result_view.setPlainText("已开启新对话，下次发送将从头开始。")
 
     def copy_result(self) -> None:
         from PySide6.QtWidgets import QApplication
@@ -214,15 +230,18 @@ class MainWindow(QWidget):
 class Worker(QThread):
     finished = Signal(object)
 
-    def __init__(self, config: AppConfig, servers: list[Server], user_prompt: str) -> None:
+    def __init__(self, config: AppConfig, servers: list[Server], user_prompt: str,
+                 session_id: str | None = None) -> None:
         super().__init__()
         self._config = config
         self._servers = servers
         self._user_prompt = user_prompt
+        self._session_id = session_id
 
     def run(self) -> None:
         try:
-            result = run_claude(self._config, self._servers, self._user_prompt)
+            result = run_claude(self._config, self._servers, self._user_prompt,
+                                self._session_id)
         except Exception as exc:
             result = ClaudeResult(status="error", output="", error=str(exc))
         self.finished.emit(result)

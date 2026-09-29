@@ -1,7 +1,7 @@
 import sys
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction
+from PySide6.QtCore import Qt, QRectF
+from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QAction, QLinearGradient, QBrush
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QMessageBox
 
 from models import default_config
@@ -10,19 +10,32 @@ from ui.main_window import MainWindow
 
 
 def make_icon() -> QIcon:
-    pm = QPixmap(64, 64)
+    pm = QPixmap(256, 256)
     pm.fill(Qt.transparent)
     painter = QPainter(pm)
     painter.setRenderHint(QPainter.Antialiasing)
-    painter.setBrush(QColor("#3b82f6"))
+
+    # 渐变方片（蓝 400 → 蓝 700），与 FloatLog.ico 同款
+    pad = 15
+    corner = 56
+    rect = QRectF(pad, pad, 256 - 2 * pad, 256 - 2 * pad)
+    grad = QLinearGradient(rect.topLeft(), rect.bottomRight())
+    grad.setColorAt(0.0, QColor("#60a5fa"))
+    grad.setColorAt(1.0, QColor("#1d4ed8"))
+    painter.setBrush(QBrush(grad))
     painter.setPen(Qt.NoPen)
-    painter.drawRoundedRect(6, 6, 52, 52, 12, 12)
-    painter.setPen(QColor("white"))
-    font = painter.font()
-    font.setBold(True)
-    font.setPixelSize(28)
-    painter.setFont(font)
-    painter.drawText(pm.rect(), Qt.AlignCenter, "L")
+    painter.drawRoundedRect(rect, corner, corner)
+
+    # 三条白色圆角日志行（左对齐，宽度错落）
+    painter.setBrush(QColor(255, 255, 255, 245))
+    lx = 54
+    line_h = 19
+    avail = 256 - 2 * lx
+    for wfrac, y in [(0.62, 77), (0.46, 118), (0.56, 159)]:
+        painter.drawRoundedRect(
+            QRectF(lx, y, wfrac * avail, line_h), line_h / 2, line_h / 2
+        )
+
     painter.end()
     return QIcon(pm)
 

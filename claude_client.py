@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ class ClaudeResult:
     status: str  # "success" | "not_found" | "timeout" | "error"
     output: str
     error: str = ""
+    session_id: str = ""  # 本次对话的 session id（空串表示没有会话）
 
     @property
     def ok(self) -> bool:
@@ -27,7 +29,24 @@ def _auth_desc(server: Server) -> str:
 
 
 def build_prompt(servers: list[Server], user_prompt: str) -> str:
-    parts = ["请连接下面这些服务器，查看错误日志并分析：", ""]
+    parts = [
+        "你是只读的服务器日志分析助手，只做一件事：查看日志、分析并报告，不做其他任何操作。",
+        "",
+        "硬性约束（必须全部遵守）：",
+        "1. 只读日志：服务是用 docker-compose 启动的，没有独立日志文件。只允许进入下面各服务器的「部署位置」目录，用 docker-compose logs（或 docker compose logs）查看容器日志；禁止读取、搜索、修改任何源代码、配置文件、数据库或其他非日志内容。",
+        "2. 只读不写：禁止在本机或任何服务器上创建、修改、删除任何文件；禁止生成脚本、工具或临时文件；禁止把密码、密钥等凭据写入任何文件。",
+        "3. 只报告不行动：只输出分析结论；禁止执行修复、改配置、重启服务、改数据库等操作；禁止在结尾问「要不要我帮你改 / 删 / 连其他服务器」之类的话。",
+        "4. 不越界：不要安装软件，不要调用除查看日志以外的任何工具或命令。",
+        "",
+        "查看日志注意：日志可能很长，按用户需求的时间范围聚焦（必要时用 docker-compose logs --tail N 或 --since/--until 限定），重点找 ERROR / 异常 / 报错。",
+        "",
+        "输出格式（对每台服务器依次输出）：",
+        "- 发现的错误：时间 + 级别 + 关键日志原文摘录",
+        "- 原因：仅基于日志内容推断，不要读代码去佐证",
+        "- 影响：影响了哪个功能",
+        "最后用不超过 3 行给出总体结论。不要列「修复建议清单」，不要给出任何下一步操作。",
+        "",
+    ]
     for i, server in enumerate(servers, start=1):
         parts.append(f"服务器 {i}：")
         parts.append(f"- 名称: {server.name}")
@@ -35,7 +54,7 @@ def build_prompt(servers: list[Server], user_prompt: str) -> str:
         parts.append(f"- 用户: {server.username}")
         parts.append(f"- 认证: {_auth_desc(server)}")
         if server.deploy_dir:
-            parts.append(f"- 部署位置: {server.deploy_dir}")
+            parts.append(f"- 部署位置（docker-compose 目录）: {server.deploy_dir}")
         if server.log_dir:
             parts.append(f"- 日志目录: {server.log_dir}")
         parts.append("")
@@ -57,15 +76,20 @@ def _resolve_windows_shim(resolved: str) -> str:
     return resolved
 
 
-def build_command(config: AppConfig) -> list[str]:
-    return [
+def build_command(config: AppConfig, *, session_id: str | None = None,
+                  resume: bool = False) -> list[str]:
+    cmd = [
         config.claude_command,
         "--print",
         "--output-format", "text",
         "--input-format", "text",
         "--add-dir", config.workspace_dir,
+        "--disallowedTools", "Write,Edit,NotebookEdit",
         "--permission-mode", config.permission_mode,
     ]
+    if session_id is not None:
+        cmd += ["--resume" if resume else "--session-id", session_id]
+    return cmd
 
 
 def launch_command(cmd: list[str]) -> list[str]:
@@ -83,7 +107,8 @@ def launch_command(cmd: list[str]) -> list[str]:
     return [resolved, *cmd[1:]]
 
 
-def run(config: AppConfig, servers: list[Server], user_prompt: str) -> ClaudeResult:
+def run(config: AppConfig, servers: list[Server], user_prompt: str,
+        session_id: str | None = None) -> ClaudeResult:
     if resolve_binary(config.claude_command) is None:
         return ClaudeResult(
             status="not_found",
@@ -91,8 +116,12 @@ def run(config: AppConfig, servers: list[Server], user_prompt: str) -> ClaudeRes
             error=f"未找到命令: {config.claude_command}",
         )
 
+    # session_id 为空 → 新开一个会话（用固定 id，方便之后 --resume 续接）
+    resume = session_id is not None
+    sid = session_id or str(uuid.uuid4())
+
     prompt = build_prompt(servers, user_prompt)
-    cmd = build_command(config)
+    cmd = build_command(config, session_id=sid, resume=resume)
     launch = launch_command(cmd)
 
     workspace = Path(config.workspace_dir)
@@ -107,22 +136,25 @@ def run(config: AppConfig, servers: list[Server], user_prompt: str) -> ClaudeRes
             encoding="utf-8",
             cwd=str(workspace),
             timeout=config.timeout_seconds,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except subprocess.TimeoutExpired:
         return ClaudeResult(
             status="timeout",
             output="",
             error=f"运行超时（{config.timeout_seconds} 秒）",
+            session_id=sid,
         )
     except OSError as exc:
-        return ClaudeResult(status="error", output="", error=str(exc))
+        return ClaudeResult(status="error", output="", error=str(exc), session_id=sid)
 
     output = proc.stdout or ""
     err = proc.stderr or ""
     if proc.returncode == 0:
-        return ClaudeResult(status="success", output=output, error=err)
+        return ClaudeResult(status="success", output=output, error=err, session_id=sid)
     return ClaudeResult(
         status="error",
         output=output,
         error=err or f"claude 退出码 {proc.returncode}",
+        session_id=sid,
     )
